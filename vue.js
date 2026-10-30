@@ -153,71 +153,89 @@
     };
   }
 
-  /* ==================== 3. 响应式系统 ==================== */
-  function observe(value) {
-    if (!value || typeof value !== 'object') return;
-    if (value.__ob__) return value.__ob__;
-    return new Observer(value);
+  /* ==================== 3. 响应式系统（Proxy 版） ==================== */
+  // 用 Proxy 拦截对象的所有操作：无需预先声明 key，新增/删除属性、数组索引赋值/方法
+  // （push/splice/下标写入）都能自动派发更新，彻底解决 defineProperty 方案的遗留问题。
+  var hasNativeProxy = typeof Proxy !== 'undefined' && typeof Reflect !== 'undefined';
+  var ITERATE_KEY = typeof Symbol !== 'undefined' ? Symbol('iterate') : 'iterate';
+  // 依赖图：rawTarget -> (key -> Dep)。用 WeakMap 外挂，避免往数据对象里注入字段污染原数据。
+  var targetMap = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+  // 代理缓存，防止同一对象被重复包装 / 代理套代理。
+  var rawToProxy = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+  var proxyToRaw = typeof WeakMap !== 'undefined' ? new WeakMap() : null;
+
+  function isObject(v) { return v !== null && typeof v === 'object'; }
+
+  // 依赖收集：当前活跃 watcher 订阅 key 对应的 Dep
+  function track(target, key) {
+    if (!Dep.target || !targetMap) return;
+    var depsMap = targetMap.get(target);
+    if (!depsMap) { depsMap = new Map(); targetMap.set(target, depsMap); }
+    var dep = depsMap.get(key);
+    if (!dep) { dep = new Dep(); depsMap.set(key, dep); }
+    dep.depend();
   }
 
-  var arrayProto = Array.prototype;
-  var arrayMethods = Object.create(arrayProto);
-  ['push', 'pop', 'shift', 'unshift', 'splice', 'sort', 'reverse'].forEach(function (m) {
-    var original = arrayProto[m];
-    def(arrayMethods, m, function () {
-      var args = arguments;
-      var result = original.apply(this, args);
-      var ob = this.__ob__;
-      var inserted = m === 'push' || m === 'unshift' || m === 'splice'
-        ? Array.prototype.slice.call(args)
-        : [];
-      observeArray(inserted);
-      if (ob) ob.dep.notify();
-      return result;
-    });
-  });
-  function def(obj, key, val) {
-    Object.defineProperty(obj, key, { value: val, writable: true, configurable: true, enumerable: false });
+  // 派发更新：通知订阅了该 key 的所有 watcher
+  function trigger(target, key) {
+    if (!targetMap) return;
+    var depsMap = targetMap.get(target);
+    if (!depsMap) return;
+    var dep = depsMap.get(key);
+    if (dep) dep.notify();
   }
 
-  function Observer(value) {
-    this.value = value;
-    this.dep = new Dep();
-    def(value, '__ob__', this);
-    if (Array.isArray(value)) {
-      Object.setPrototypeOf(value, arrayMethods);
-      observeArray(value);
-    } else {
-      this.walk(value);
-    }
-  }
-  Observer.prototype.walk = function (obj) {
-    Object.keys(obj).forEach(function (k) { defineReactive(obj, k, obj[k]); });
-  };
-  function observeArray(arr) {
-    for (var i = 0; i < arr.length; i++) observe(arr[i]);
-  }
-
-  function defineReactive(obj, key, val) {
-    var dep = new Dep();
-    var childOb = observe(val);
-    Object.defineProperty(obj, key, {
-      enumerable: true,
-      configurable: true,
-      get: function () {
-        if (Dep.target) {
-          dep.depend();
-          if (childOb) childOb.dep.depend();
-        }
-        return val;
-      },
-      set: function (newVal) {
-        if (newVal === val) return;
-        val = newVal;
-        childOb = observe(newVal);
-        dep.notify();
+  var reactiveHandlers = {
+    get: function (target, key, receiver) {
+      var res = Reflect.get(target, key, receiver);
+      if (typeof key !== 'symbol') track(target, key);
+      // 懒代理：读到嵌套子对象时才包装，覆盖运行时新增的深层数据，同时减少初始化开销
+      if (isObject(res)) return toReactive(res);
+      return res;
+    },
+    set: function (target, key, value, receiver) {
+      var had = Object.prototype.hasOwnProperty.call(target, key);
+      // 写入的新对象同样转成响应式，保证后续对该对象的深层修改仍可被追踪
+      if (isObject(value)) value = toReactive(value);
+      var res = Reflect.set(target, key, value, receiver);
+      if (res) {
+        if (!had) trigger(target, ITERATE_KEY); // 新增键：让 v-for / 遍历也能感知
+        trigger(target, key);
       }
-    });
+      return res;
+    },
+    deleteProperty: function (target, key) {
+      var had = Object.prototype.hasOwnProperty.call(target, key);
+      var res = Reflect.deleteProperty(target, key);
+      if (had && res) { trigger(target, ITERATE_KEY); trigger(target, key); }
+      return res;
+    },
+    has: function (target, key) {
+      if (typeof key !== 'symbol') track(target, key); // 支持 'x' in obj 的依赖收集
+      return Reflect.has(target, key);
+    },
+    ownKeys: function (target) {
+      track(target, ITERATE_KEY); // 支持 for...in / Object.keys 感知新增成员
+      return Reflect.ownKeys(target);
+    }
+  };
+
+  // 把对象包装成响应式代理：已代理则直接复用；不支持 Proxy 的环境退化为普通对象（仅失去响应式）
+  function toReactive(value) {
+    if (!isObject(value)) return value;
+    if (proxyToRaw && proxyToRaw.has(value)) return value;
+    if (!hasNativeProxy || !rawToProxy) return value;
+    var cached = rawToProxy.get(value);
+    if (cached) return cached;
+    var proxy = new Proxy(value, reactiveHandlers);
+    rawToProxy.set(value, proxy);
+    proxyToRaw.set(proxy, value);
+    return proxy;
+  }
+
+  // 兼容旧调用点：返回的代理需由调用方用返回值替换原引用（见 _init）
+  function observe(value) {
+    return toReactive(value);
   }
 
   /* ==================== 4. 表达式取值/赋值 ==================== */
@@ -822,11 +840,20 @@
       }
     }
 
+    // renderList 的「收集」阶段：在依赖收集期（Dep.target 存在）读取源列表并 normalize，
+    // 这样数组的元素下标 / length / 遍历（ITERATE_KEY）都会被订阅到当前渲染 watcher，
+    // 原地修改（items[0]=x、push 等）才能正确触发重渲染。
     function renderList() {
-      renderByIndex(normalizeList(getValue(vm, info.value, scope)));
+      var newNorm = normalizeList(getValue(vm, info.value, scope));
+      renderByIndex(newNorm);
     }
+    // watcher 的 getter 主动读取并 normalize（收集元素级依赖），返回对象保证 run() 恒重渲染；
+    // 首次进入即由构造时的 get() 完成依赖收集 + 渲染
+    new Watcher(vm, function () {
+      return normalizeList(getValue(vm, info.value, scope));
+    }, renderList);
 
-    new Watcher(vm, function () { return getValue(vm, info.value, scope); }, renderList);
+    // 首次渲染（依赖已在构造 get() 阶段收集完成）
     renderList();
   }
 
@@ -862,12 +889,12 @@
     var opts = vm._options;
 
     vm.$data = typeof opts.data === 'function' ? opts.data() : (opts.data || {});
+    // 必须用 observe 返回的代理接管 $data，这样后续所有读操作才会收集依赖
+    vm.$data = observe(vm.$data);
     vm.$computed = {};
 
     // 代理 data 到实例，方便 this.xxx 访问
     proxyData(vm, vm.$data);
-    // 必须先让 data 响应式，computed 初始化时才能收集到正确的依赖
-    observe(vm.$data);
 
     vm.$methods = opts.methods || {};
     bindMethods(vm);
