@@ -370,11 +370,13 @@
   // 注意：运行时通过 $data 新增的属性在"简单路径"下仍能被 getValue 动态读到（hasOwnProperty 实时判断），
   // 仅在"复杂表达式把新属性当自由变量"这一少见场景下不在作用域内，属可接受的取舍。
   function compiledKeys(vm, scope) {
-    var dataKeys, compKeys;
+    var dataKeys, compKeys, methodKeys;
     if (vm._exprDataKeys) dataKeys = vm._exprDataKeys;
     else { dataKeys = Object.keys(vm.$data).filter(isId); vm._exprDataKeys = dataKeys; }
     if (vm._exprCompKeys) compKeys = vm._exprCompKeys;
     else { compKeys = Object.keys(vm.$computed).filter(isId); vm._exprCompKeys = compKeys; }
+    if (vm._exprMethodKeys) methodKeys = vm._exprMethodKeys;
+    else { methodKeys = Object.keys(vm.$methods).filter(isId); vm._exprMethodKeys = methodKeys; }
     var scopeKeys = [];
     if (scope) {
       if (scopeKeyCache) {
@@ -385,15 +387,16 @@
         scopeKeys = Object.keys(scope).filter(isId);
       }
     }
-    return { d: dataKeys, c: compKeys, s: scopeKeys };
+    return { d: dataKeys, c: compKeys, m: methodKeys, s: scopeKeys };
   }
   function evalExp(vm, exp, scope) {
     var k = compiledKeys(vm, scope);
-    var all = dedupe(k.s.concat(k.d).concat(k.c));
+    var all = dedupe(k.s.concat(k.d).concat(k.c).concat(k.m));
     var args = all.map(function (key) {
       if (scope && key in scope) return scope[key];
       if (key in vm.$data) return vm.$data[key];
-      return vm.$computed[key];
+      if (key in vm.$computed) return vm.$computed[key];
+      return vm.$methods[key];
     });
     var cacheKey = exp + '\u0000' + all.join(',');
     var fn = expCache[cacheKey];
@@ -573,7 +576,7 @@
         bindModel(node, vm, value, scope, modelMods);
         continue;
       }
-      if (onRE.test(name)) { bindEvent(node, vm, name.replace(onRE, ''), value); continue; }
+      if (onRE.test(name)) { bindEvent(node, vm, name.replace(onRE, ''), value, scope); continue; }
       if (bindRE.test(name)) {
         var bname = name.replace(bindRE, '');
         if (bname === 'key') continue; // v-for 的 :key 是元信息，不写入 DOM 属性
@@ -647,7 +650,8 @@
     while (child) { unbindTree(child); child = child.nextSibling; }
   }
 
-  function bindEvent(node, vm, eventSpec, handlerExp) {
+  function bindEvent(node, vm, eventSpec, handlerExp, scope) {
+    scope = scope || {}; // 非 v-for 场景无循环作用域，用空对象兜底，避免 with(undefined) 抛错
     // 解析事件名与修饰符：@click.stop.prevent、@keydown.enter ...
     var parts = eventSpec.split('.');
     var eventName = parts[0];
@@ -677,7 +681,7 @@
         // 通过 vm 代理的 getter/setter 保证 count++ 这类写操作能正确回写数据；
         // 编译结果按 handlerExp 缓存，避免高频事件每次触发都 new Function
         var fn = getEventFn(vm, handlerExp);
-        fn(vm, e);
+        fn(vm, scope, e);
       } catch (err) { handleError(vm, err, '事件处理出错: ' + handlerExp); }
     }
 
@@ -761,8 +765,8 @@
   function getEventFn(vm, handlerExp) {
     var fn = eventFnCache[handlerExp];
     if (!fn) {
-      var exp = 'with(vm){ return (' + handlerCompile(handlerExp) + '); }';
-      fn = new Function('vm', '$event', exp);
+      var exp = 'with(vm){ with(scope){ return (' + handlerCompile(handlerExp) + '); } }';
+      fn = new Function('vm', 'scope', '$event', exp);
       lruSet(eventFnCache, handlerExp, fn);
     }
     return fn;
